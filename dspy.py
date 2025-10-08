@@ -4,7 +4,6 @@ import dspy
 import os, json, time, pathlib, re
 from dspy.datasets import MATH
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 #pip install git+https://github.com/hendrycks/math.git
 SAMPLE_SIZE = 100
