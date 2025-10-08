@@ -1,7 +1,5 @@
 import os
-_zixin_api = "OPENAI_KEY_REDACTED"
-os.environ["OPENAI_API_KEY"] = _zixin_api 
-#pip install git+https://github.com/hendrycks/math.git
+
 import dspy 
 import os, json, time, pathlib, re
 from dspy.datasets import MATH
