@@ -1,0 +1,9 @@
+{
+  "run_id": "20251008_110831",
+  "split": "dev",
+  "num_examples": 350,
+  "num_correct": 265,
+  "accuracy": 0.7571428571428571,
+  "model_default": "openai/gpt-4o-mini-2024-07-18",
+  "module": "ChainOfThought(question -> answer)"
+}

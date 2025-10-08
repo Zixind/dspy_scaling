@@ -1,6 +1,6 @@
 import logging
 from collections import defaultdict
-
+import copy
 import dspy
 from dspy.evaluate.evaluate import Evaluate
 from dspy.signatures import Signature
@@ -68,7 +68,7 @@ class COPRO(Teleprompter):
         **_kwargs,
     ):
         if breadth <= 1:
-            raise ValueError("Breadth must be greater than 1")
+            raise ValueError("Breadth must be greater than 1")   #Zixin modifies
         self.metric = metric
         self.breadth = breadth
         self.depth = depth
@@ -180,7 +180,7 @@ class COPRO(Teleprompter):
         latest_candidates = candidates
         all_candidates = candidates
 
-        module_clone = module.deepcopy()
+        module_clone = copy.copy(module)#module.deepcopy()
 
         # For each iteration in depth...
         for d in range(
@@ -225,7 +225,7 @@ class COPRO(Teleprompter):
                         f"At Depth {d+1}/{self.depth}, Evaluating Prompt Candidate #{c_i+1}/{len(candidates_)} for "
                         f"Predictor {p_i+1} of {len(module.predictors())}.",
                     )
-                    score = evaluate(module_clone, devset=trainset, **eval_kwargs).score
+                    score = evaluate(module_clone, devset=trainset, **eval_kwargs).score      #Zixin: evaluate on trainset
                     if self.prompt_model:
                         logger.debug(f"prompt_model.inspect_history(n=1) {self.prompt_model.inspect_history(n=1)}")
                     total_calls += 1
@@ -240,7 +240,7 @@ class COPRO(Teleprompter):
                         # Add it to our evaluated candidates list
                         evaluated_candidates[id(p_old)][(instruction, prefix)] = {
                             "score": score,
-                            "program": module_clone.deepcopy(),
+                            # "program": module_clone.deepcopy(),
                             "instruction": instruction,
                             "prefix": prefix,
                             "depth": d,
@@ -304,7 +304,7 @@ class COPRO(Teleprompter):
                     attempts.append(f'Prefix #{shortest_len-i}: {best_predictors[i]["prefix"]}')
                     attempts.append(f'Resulting Score #{shortest_len-i}: {best_predictors[i]["score"]}')
 
-                # Generate next batch of potential prompts to optimize, with previous attempts as input
+                # Generate next batch of potential prompts to optimize, with previous attempts as input   #this is where we need to modify for promptwise and blockwise generation
                 if self.prompt_model:
                     with dspy.settings.context(lm=self.prompt_model):
                         instr = dspy.Predict(
@@ -347,7 +347,32 @@ class COPRO(Teleprompter):
 
         candidates = self._drop_duplicates(candidates)
 
-        best_program = candidates[0]["program"]
+        # best_program = candidates[0]["program"]
+        best_candidate = candidates[0]
+        # best_program = module.deepcopy()   # fresh clone
+        # for predictor in best_program.predictors():
+        #     *_, last_key = self._get_signature(predictor).fields.keys()
+        #     updated_signature = (
+        #         self._get_signature(predictor)
+        #         .with_instructions(best_candidate["instruction"])
+        #         .with_updated_fields(last_key, prefix=best_candidate["prefix"])
+        #     )
+        #     self._set_signature(predictor, updated_signature)
+        
+        best_program = student.__class__()  # make a new empty Program of same class
+        # re-attach predictors with the chosen best signatures
+        for predictor in student.predictors():
+            new_predictor = predictor.__class__()  # or a light clone
+            *_, last_key = self._get_signature(new_predictor).fields.keys()
+            updated_signature = (
+                self._get_signature(new_predictor)
+                .with_instructions(best_candidate["instruction"])
+                .with_updated_fields(last_key, prefix=best_candidate["prefix"])
+            )
+            self._set_signature(new_predictor, updated_signature)
+            best_program.add_predictor(new_predictor)
+        
+            
         best_program.candidate_programs = candidates
         best_program.total_calls = total_calls
         if self.track_stats:

@@ -3,7 +3,7 @@ import re
 
 
 class MATH:
-    def __init__(self, subset):
+    def __init__(self, subset, sample_size = None):
         from datasets import load_dataset
 
         import dspy
@@ -19,10 +19,24 @@ class MATH:
             ).with_inputs("question")
             for example in ds["test"]
         ]
-
-        size = min(350, len(dataset) // 3)
-        random.Random(0).shuffle(dataset)
-        self.train, self.dev, self.test = dataset[:size], dataset[size : 2 * size], dataset[2 * size :]
+        if sample_size is not None:
+            assert type(sample_size) == int, "Sample size must be an integer."
+            if sample_size < 350:
+                trainset = dataset[:sample_size]
+                sample_size_init = min(350, len(dataset) // 3)
+                devset = dataset[sample_size_init: 2 * sample_size_init]  #originally 350 dev set
+                testset = dataset[2 * sample_size_init:]
+                
+            else:
+                trainset = dataset[:sample_size]
+                devset = dataset[sample_size: sample_size + 350]  #originally 350 dev set
+                testset = dataset[sample_size + 350:] #manually add 350
+            self.train, self.dev, self.test = trainset, devset, testset
+        
+        else:
+            size = min(350, len(dataset) // 3)
+            random.Random(0).shuffle(dataset)
+            self.train, self.dev, self.test = dataset[:size], dataset[size : 2 * size], dataset[2 * size :]
 
     def metric(self, example, pred, trace=None):
         try:
