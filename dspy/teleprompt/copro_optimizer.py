@@ -122,41 +122,53 @@ class COPRO(Teleprompter):
 
     def compile(self, student, *, trainset, eval_kwargs):
         """
-        optimizes `signature` of `student` program - note that it may be zero-shot or already pre-optimized (demos already chosen - `demos != []`)
+        Optimizes the signatures of `student` by searching over instructions/prefixes.
 
-        parameters:
-        student: program to optimize and left modified. Inferencing Model
-        trainset: iterable of `Example`s
-        eval_kwargs: optional, dict
-           Additional keywords to go into `Evaluate` for the metric.
+        Args:
+            student: DSPy Program to optimize (mutated during search).
+            trainset: iterable of Examples used for scoring.
+            eval_kwargs: dict of kwargs forwarded to Evaluate(...).
 
-        Returns optimized version of `student`.
+        Returns:
+            best_program: a fresh Program of the same class with each predictor set
+                      to its best (instruction, prefix), plus some stats attached.
         """
-        module = student.deepcopy()
+        module = student  # work in-place; avoid deepcopy
         evaluate = Evaluate(devset=trainset, metric=self.metric, **eval_kwargs)
         total_calls = 0
-        results_best = {
-            id(p): {"depth": [], "max": [], "average": [], "min": [], "std": []} for p in module.predictors()
-        }
-        results_latest = {
-            id(p): {"depth": [], "max": [], "average": [], "min": [], "std": []} for p in module.predictors()
-        }
 
         if self.track_stats:
             import numpy as np
+            results_best = {id(p): {"depth": [], "max": [], "average": [], "min": [], "std": []}
+                            for p in module.predictors()}
+            results_latest = {id(p): {"depth": [], "max": [], "average": [], "min": [], "std": []}
+                            for p in module.predictors()}
 
+        # Helper: set a predictor's signature (instruction, prefix)
+        def _apply_sig(pred, instruction, prefix):
+            *_, last_key = self._get_signature(pred).fields.keys()
+            updated = (
+                self._get_signature(pred)
+                .with_instructions(instruction)
+                .with_updated_fields(last_key, prefix=prefix)
+            )
+            self._set_signature(pred, updated)
+
+        # Seed candidates and remember each predictor's initial "best" config
         candidates = {}
-        evaluated_candidates = defaultdict(dict)
+        evaluated_candidates = defaultdict(dict)  # per-predictor: {(instr, prefix): {...}}
+        best_config = {}  # per-predictor id -> (instr, prefix)
 
-        # Seed the prompt optimizer zero shot with just the instruction, generate BREADTH new prompts
         for predictor in module.predictors():
-            basic_instruction = None
-            basic_prefix = None
+            # read baseline
             *_, last_key = self._get_signature(predictor).fields.keys()
             basic_instruction = self._get_signature(predictor).instructions
             basic_prefix = self._get_signature(predictor).fields[last_key].json_schema_extra["prefix"]
+            best_config[id(predictor)] = (basic_instruction, basic_prefix)
+
+            # generate breadth-1 new prompts from prompt_model (plus the baseline)
             if self.prompt_model:
-                with dspy.settings.context(lm=self.prompt_model): #self.prompt_model generate instructions
+                with dspy.settings.context(lm=self.prompt_model):
                     instruct = dspy.Predict(
                         BasicGenerateInstruction,
                         n=self.breadth - 1,
@@ -168,9 +180,11 @@ class COPRO(Teleprompter):
                     n=self.breadth - 1,
                     temperature=self.init_temperature,
                 )(basic_instruction=basic_instruction)
-            # Add in our initial prompt as a candidate as well
+
+            # include baseline as a candidate
             instruct.completions.proposed_instruction.append(basic_instruction)
             instruct.completions.proposed_prefix_for_output_field.append(basic_prefix)
+
             candidates[id(predictor)] = instruct.completions
             evaluated_candidates[id(predictor)] = {}
 
@@ -178,133 +192,111 @@ class COPRO(Teleprompter):
             logger.debug(f"{self.prompt_model.inspect_history(n=1)}")
 
         latest_candidates = candidates
-        all_candidates = candidates
+        all_candidates = candidates  # grows over depth for multi-predictor programs
 
-        module_clone = copy.copy(module)#module.deepcopy()
-
-        # For each iteration in depth...
-        for d in range(
-            self.depth,
-        ):  # TODO: fix this so that we eval the new batch of predictors with the new best following predictors
+        # ==== Search over depth ====
+        for d in range(self.depth):
             logger.info(f"Iteration Depth: {d+1}/{self.depth}.")
 
-            latest_scores = []
-
-            # Go through our module's predictors
-            for p_i, (p_old, p_new) in enumerate(zip(module.predictors(), module_clone.predictors(), strict=False)):
-                candidates_ = latest_candidates[id(p_old)]  # Use the most recently generated candidates for evaluation
+            # Iterate predictors; keep others fixed at their current best while testing this one's candidates
+            for p_i, p in enumerate(module.predictors()):
+                # Choose the candidate pool to test for this predictor
+                cand_pool = latest_candidates[id(p)]
                 if len(module.predictors()) > 1:
-                    # Unless our program has multiple predictors, in which case we need to reevaluate all prompts with
-                    # the new prompt(s) for the other predictor(s).
-                    candidates_ = all_candidates[
-                        id(p_old)
-                    ]
+                    cand_pool = all_candidates[id(p)]
 
-                # For each candidate
-                for c_i, c in enumerate(candidates_):
-                    # Get the candidate instruction and prefix
-                    instruction, prefix = (
-                        c.proposed_instruction.strip('"').strip(),
-                        c.proposed_prefix_for_output_field.strip('"').strip(),
-                    )
+                latest_scores = []
 
-                    # Set this new module with our instruction / prefix
-                    *_, last_key = self._get_signature(p_new).fields.keys()
-                    updated_signature = (
-                        self._get_signature(p_new)
-                        .with_instructions(instruction)
-                        .with_updated_fields(last_key, prefix=prefix)
-                    )
-                    self._set_signature(p_new, updated_signature)
+                for c_i, c in enumerate(cand_pool):
+                    instruction = c.proposed_instruction.strip('"').strip()
+                    prefix = c.proposed_prefix_for_output_field.strip('"').strip()
 
-                    # Score the instruction / prefix
-                    for i, predictor in enumerate(module_clone.predictors()):
-                        logger.debug(f"Predictor {i+1}")
-                        self._print_signature(predictor)
+                    # Apply candidate for current predictor; others use their best_config
+                    for q in module.predictors():
+                        instr_q, pref_q = best_config[id(q)]
+                        if q is p:
+                            _apply_sig(q, instruction, prefix)
+                        else:
+                            _apply_sig(q, instr_q, pref_q)
+
+                    # Optional debug print
+                    for idx, pred_dbg in enumerate(module.predictors()):
+                        logger.debug(f"Predictor {idx+1}")
+                        self._print_signature(pred_dbg)
+
                     logger.info(
-                        f"At Depth {d+1}/{self.depth}, Evaluating Prompt Candidate #{c_i+1}/{len(candidates_)} for "
-                        f"Predictor {p_i+1} of {len(module.predictors())}.",
+                        f"At Depth {d+1}/{self.depth}, Evaluating Prompt Candidate "
+                        f"#{c_i+1}/{len(cand_pool)} for Predictor {p_i+1} of {len(module.predictors())}."
                     )
-                    score = evaluate(module_clone, devset=trainset, **eval_kwargs).score      #Zixin: evaluate on trainset
+                    result = evaluate(module, devset=trainset, **eval_kwargs)
+                    score = result.score
                     if self.prompt_model:
                         logger.debug(f"prompt_model.inspect_history(n=1) {self.prompt_model.inspect_history(n=1)}")
                     total_calls += 1
 
-                    replace_entry = True
-                    logger.debug(f"(instruction, prefix) {(instruction, prefix)}")
-                    if (instruction, prefix) in evaluated_candidates[id(p_old)]:
-                        if evaluated_candidates[id(p_old)][(instruction, prefix)]["score"] >= score:
-                            replace_entry = False
-
-                    if replace_entry:
-                        # Add it to our evaluated candidates list
-                        evaluated_candidates[id(p_old)][(instruction, prefix)] = {
+                    # Keep the best score per (instruction, prefix)
+                    key = (instruction, prefix)
+                    prev = evaluated_candidates[id(p)].get(key)
+                    if prev is None or prev["score"] < score:
+                        evaluated_candidates[id(p)][key] = {
                             "score": score,
-                            # "program": module_clone.deepcopy(),
                             "instruction": instruction,
                             "prefix": prefix,
                             "depth": d,
                         }
 
-                    if len(candidates_) - self.breadth <= c_i:
+                    # track only the newest breadth scores (for stats)
+                    if len(cand_pool) - self.breadth <= c_i:
                         latest_scores.append(score)
 
-                if self.track_stats:
-                    results_latest[id(p_old)]["depth"].append(d)
-                    results_latest[id(p_old)]["max"].append(max(latest_scores))
-                    results_latest[id(p_old)]["average"].append(sum(latest_scores) / len(latest_scores))
-                    results_latest[id(p_old)]["min"].append(min(latest_scores))
-                    results_latest[id(p_old)]["std"].append(np.std(latest_scores))
+                # Track "latest" stats
+                if self.track_stats and latest_scores:
+                    results_latest[id(p)]["depth"].append(d)
+                    results_latest[id(p)]["max"].append(max(latest_scores))
+                    results_latest[id(p)]["average"].append(sum(latest_scores) / len(latest_scores))
+                    results_latest[id(p)]["min"].append(min(latest_scores))
+                    results_latest[id(p)]["std"].append(np.std(latest_scores))
 
-                # Now that we've evaluated the candidates, set this predictor to the best performing version
-                # to ensure the next round of scores reflect the best possible version
-                best_candidate = max(evaluated_candidates[id(p_old)].values(), key=lambda candidate: candidate["score"])
-                *_, last_key = self._get_signature(p_old).fields.keys()
-                updated_signature = (
-                    self._get_signature(p_new)
-                    .with_instructions(best_candidate["instruction"])
-                    .with_updated_fields(last_key, prefix=best_candidate["prefix"])
-                )
-                self._set_signature(p_new, updated_signature)
+                # Update greedy best config for this predictor
+                best_for_p = max(evaluated_candidates[id(p)].values(), key=lambda cc: cc["score"])
+                best_config[id(p)] = (best_for_p["instruction"], best_for_p["prefix"])
 
                 logger.debug(
-                    f"Updating Predictor {id(p_old)} to:\ni: {best_candidate['instruction']}\n"
-                    f"p: {best_candidate['prefix']}",
+                    f"Updating Predictor {id(p)} to:\n"
+                    f"i: {best_for_p['instruction']}\n"
+                    f"p: {best_for_p['prefix']}"
                 )
-                logger.debug("Full predictor with update: ")
-                for i, predictor in enumerate(module_clone.predictors()):
-                    logger.debug(f"Predictor {i}")
-                    self._print_signature(predictor)
 
+            # Stop before generating next wave
             if d == self.depth - 1:
                 break
 
+            # === Generate next batch from attempts (top-K history) ===
             new_candidates = {}
             for p_base in module.predictors():
-                # Build Few-Shot Example of Optimized Prompts
+                # Build attempts list from best-so-far evaluated candidates
+                best_list = sorted(
+                    evaluated_candidates[id(p_base)].values(),
+                    key=lambda x: x["score"],
+                    reverse=True,
+                )
+                k = min(len(best_list), self.breadth)
                 attempts = []
-                shortest_len = self.breadth
-                shortest_len = min(len(evaluated_candidates[id(p_base)]), shortest_len)
-                best_predictors = list(evaluated_candidates[id(p_base)].values())
+                # Put k items, lower-scored to higher-scored (as your original did)
+                for i in range(k - 1, -1, -1):
+                    attempts.append(f'Instruction #{k-i}: {best_list[i]["instruction"]}')
+                    attempts.append(f'Prefix #{k-i}: {best_list[i]["prefix"]}')
+                    attempts.append(f'Resulting Score #{k-i}: {best_list[i]["score"]}')
 
-                # best_predictors = evaluated_candidates[id(p_base)].values()[:]
-                best_predictors.sort(key=lambda x: x["score"], reverse=True)
-
-                if self.track_stats:
-                    scores = [x["score"] for x in best_predictors][:10]
+                if self.track_stats and best_list:
+                    top10 = [x["score"] for x in best_list[:10]]
                     results_best[id(p_base)]["depth"].append(d)
-                    results_best[id(p_base)]["max"].append(max(scores))
-                    results_best[id(p_base)]["average"].append(sum(scores) / len(scores))
-                    results_best[id(p_base)]["min"].append(min(scores))
-                    results_best[id(p_base)]["std"].append(np.std(scores))
+                    results_best[id(p_base)]["max"].append(max(top10))
+                    results_best[id(p_base)]["average"].append(sum(top10) / len(top10))
+                    results_best[id(p_base)]["min"].append(min(top10))
+                    results_best[id(p_base)]["std"].append(np.std(top10))
 
-                for i in range(shortest_len - 1, -1, -1):
-                    # breakpoint()
-                    attempts.append(f'Instruction #{shortest_len-i}: {best_predictors[i]["instruction"]}')
-                    attempts.append(f'Prefix #{shortest_len-i}: {best_predictors[i]["prefix"]}')
-                    attempts.append(f'Resulting Score #{shortest_len-i}: {best_predictors[i]["score"]}')
-
-                # Generate next batch of potential prompts to optimize, with previous attempts as input   #this is where we need to modify for promptwise and blockwise generation
+                # Propose next prompts conditioned on attempts
                 if self.prompt_model:
                     with dspy.settings.context(lm=self.prompt_model):
                         instr = dspy.Predict(
@@ -319,64 +311,287 @@ class COPRO(Teleprompter):
                         temperature=self.init_temperature,
                     )(attempted_instructions=attempts)
 
-                # Get candidates for each predictor
+                # Save/accumulate
                 new_candidates[id(p_base)] = instr.completions
                 all_candidates[id(p_base)].proposed_instruction.extend(instr.completions.proposed_instruction)
                 all_candidates[id(p_base)].proposed_prefix_for_output_field.extend(
-                    instr.completions.proposed_prefix_for_output_field,
+                    instr.completions.proposed_prefix_for_output_field
                 )
 
             latest_candidates = new_candidates
 
-        candidates = []
+    # ==== Final selection & return a fresh program ====
+    # Flatten all evaluated candidates just for reporting/debug
+        flat = []
         for predictor in module.predictors():
-            candidates.extend(list(evaluated_candidates[id(predictor)].values()))
+            flat.extend(list(evaluated_candidates[id(predictor)].values()))
 
-            if self.track_stats:
-                best_predictors = list(evaluated_candidates[id(predictor)].values())
-                best_predictors.sort(key=lambda x: x["score"], reverse=True)
+        # Deduplicate by (instruction, prefix) while keeping best score
+        seen = {}
+        for c in flat:
+            k = (c["instruction"], c["prefix"])
+            if k not in seen or seen[k]["score"] < c["score"]:
+                seen[k] = c
+        candidates_flat = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
 
-                scores = [x["score"] for x in best_predictors][:10]
-                results_best[id(predictor)]["depth"].append(d)
-                results_best[id(predictor)]["max"].append(max(scores))
-                results_best[id(predictor)]["average"].append(sum(scores) / len(scores))
-                results_best[id(predictor)]["min"].append(min(scores))
-                results_best[id(predictor)]["std"].append(np.std(scores))
+        # Apply each predictor's own best config to the module and return it
+        for p in module.predictors():
+            instr, pref = best_config[id(p)]
+            _apply_sig(p, instr, pref)
 
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-
-        candidates = self._drop_duplicates(candidates)
-
-        # best_program = candidates[0]["program"]
-        best_candidate = candidates[0]
-        # best_program = module.deepcopy()   # fresh clone
-        # for predictor in best_program.predictors():
-        #     *_, last_key = self._get_signature(predictor).fields.keys()
-        #     updated_signature = (
-        #         self._get_signature(predictor)
-        #         .with_instructions(best_candidate["instruction"])
-        #         .with_updated_fields(last_key, prefix=best_candidate["prefix"])
-        #     )
-        #     self._set_signature(predictor, updated_signature)
-        
-        best_program = student.__class__()  # make a new empty Program of same class
-        # re-attach predictors with the chosen best signatures
-        for predictor in student.predictors():
-            new_predictor = predictor.__class__()  # or a light clone
-            *_, last_key = self._get_signature(new_predictor).fields.keys()
-            updated_signature = (
-                self._get_signature(new_predictor)
-                .with_instructions(best_candidate["instruction"])
-                .with_updated_fields(last_key, prefix=best_candidate["prefix"])
-            )
-            self._set_signature(new_predictor, updated_signature)
-            best_program.add_predictor(new_predictor)
-        
-            
-        best_program.candidate_programs = candidates
-        best_program.total_calls = total_calls
+        # Attach diagnostics
+        module.candidate_programs = candidates_flat
+        module.total_calls = total_calls
         if self.track_stats:
-            best_program.results_best = results_best
-            best_program.results_latest = results_latest
+            module.results_best = results_best
+            module.results_latest = results_latest
 
-        return best_program
+        return module
+    
+    def compile_gumbel_top_k(self, student, *, trainset, minibatch_val_size=None, rng_seed = 0, eval_kwargs):
+        """
+        Optimizes the signatures of `student` by searching over instructions/prefixes.
+
+        Args:
+            student: DSPy Program to optimize (mutated during search).
+            trainset: iterable of Examples used for scoring.
+            eval_kwargs: dict of kwargs forwarded to Evaluate(...).
+            minibatch_val_size: if set (int), evaluate on a random mini-batch of this size per depth.
+                        A new batch is drawn at every depth; all candidates in that depth share it.
+            rng_seed: base seed for reproducible per-depth mini-batch sampling.
+
+
+        Returns:
+            best_program: a fresh Program of the same class with each predictor set
+                      to its best (instruction, prefix), plus some stats attached.
+        """
+        module = student  # work in-place; avoid deepcopy
+        
+        total_calls = 0
+        # Materialize once so we can sample indices reproducibly
+        trainset_list = list(trainset)
+        evaluate = Evaluate(devset=trainset, metric=self.metric, **eval_kwargs)
+
+        if self.track_stats:
+            import numpy as np
+            results_best = {id(p): {"depth": [], "max": [], "average": [], "min": [], "std": []}
+                            for p in module.predictors()}
+            results_latest = {id(p): {"depth": [], "max": [], "average": [], "min": [], "std": []}
+                            for p in module.predictors()}
+
+        # Helper: set a predictor's signature (instruction, prefix)
+        def _apply_sig(pred, instruction, prefix):
+            *_, last_key = self._get_signature(pred).fields.keys()
+            updated = (
+                self._get_signature(pred)
+                .with_instructions(instruction)
+                .with_updated_fields(last_key, prefix=prefix)
+            )
+            self._set_signature(pred, updated)
+        
+        def subsample(data, k, seed=42):
+            rng = random.Random(seed)
+            idxs = list(range(len(data)))
+            rng.shuffle(idxs)
+            chosen = idxs[:min(k, len(data))]
+            return [data[i] for i in chosen]
+
+        # Seed candidates and remember each predictor's initial "best" config
+        candidates = {}
+        evaluated_candidates = defaultdict(dict)  # per-predictor: {(instr, prefix): {...}}
+        best_config = {}  # per-predictor id -> (instr, prefix)
+        
+
+        for predictor in module.predictors():
+            # read baseline
+            *_, last_key = self._get_signature(predictor).fields.keys()
+            basic_instruction = self._get_signature(predictor).instructions
+            basic_prefix = self._get_signature(predictor).fields[last_key].json_schema_extra["prefix"]
+            best_config[id(predictor)] = (basic_instruction, basic_prefix)
+
+            # generate breadth-1 new prompts from prompt_model (plus the baseline)
+            if self.prompt_model:
+                with dspy.settings.context(lm=self.prompt_model):
+                    instruct = dspy.Predict(
+                        BasicGenerateInstruction,
+                        n=self.breadth - 1,
+                        temperature=self.init_temperature,
+                    )(basic_instruction=basic_instruction)
+            else:
+                instruct = dspy.Predict(
+                    BasicGenerateInstruction,
+                    n=self.breadth - 1,
+                    temperature=self.init_temperature,
+                )(basic_instruction=basic_instruction)
+
+            # include baseline as a candidate
+            instruct.completions.proposed_instruction.append(basic_instruction)
+            instruct.completions.proposed_prefix_for_output_field.append(basic_prefix)
+
+            candidates[id(predictor)] = instruct.completions
+            evaluated_candidates[id(predictor)] = {}
+
+        if self.prompt_model:
+            logger.debug(f"{self.prompt_model.inspect_history(n=1)}")
+
+        latest_candidates = candidates
+        all_candidates = candidates  # grows over depth for multi-predictor programs
+
+        # ==== Search over depth ====
+        for d in range(self.depth):
+            if minibatch_val_size is None or minibatch_val_size >= len(trainset_list):
+                dev_batch = trainset_list
+            else:
+                rng_draw = np.random.default_rng(1)
+                dev_batch = subsample(trainset_list, minibatch_val_size, seed = rng_draw)
+            logger.info(f"Iteration Depth: {d+1}/{self.depth}.")
+
+            # Iterate predictors; keep others fixed at their current best while testing this one's candidates
+            for p_i, p in enumerate(module.predictors()):
+                # Choose the candidate pool to test for this predictor
+                cand_pool = latest_candidates[id(p)]
+                if len(module.predictors()) > 1:
+                    cand_pool = all_candidates[id(p)]
+
+                latest_scores = []
+
+                for c_i, c in enumerate(cand_pool):
+                    instruction = c.proposed_instruction.strip('"').strip()
+                    prefix = c.proposed_prefix_for_output_field.strip('"').strip()
+
+                    # Apply candidate for current predictor; others use their best_config
+                    for q in module.predictors():
+                        instr_q, pref_q = best_config[id(q)]
+                        if q is p:
+                            _apply_sig(q, instruction, prefix)
+                        else:
+                            _apply_sig(q, instr_q, pref_q)
+
+                    # Optional debug print
+                    for idx, pred_dbg in enumerate(module.predictors()):
+                        logger.debug(f"Predictor {idx+1}")
+                        self._print_signature(pred_dbg)
+
+                    logger.info(
+                        f"At Depth {d+1}/{self.depth}, Evaluating Prompt Candidate "
+                        f"#{c_i+1}/{len(cand_pool)} for Predictor {p_i+1} of {len(module.predictors())}."
+                    )
+                    result = evaluate(module, devset=dev_batch, **eval_kwargs) #evaluate on dev_batch
+                    score = result.score
+                    if self.prompt_model:
+                        logger.debug(f"prompt_model.inspect_history(n=1) {self.prompt_model.inspect_history(n=1)}")
+                    total_calls += 1
+
+                    # Keep the best score per (instruction, prefix) need to modify
+                    key = (instruction, prefix)
+                    prev = evaluated_candidates[id(p)].get(key)
+                    if prev is None or prev["score"] < score:
+                        evaluated_candidates[id(p)][key] = {
+                            "score": score,
+                            "instruction": instruction,
+                            "prefix": prefix,
+                            "depth": d,
+                        }
+
+                    # track only the newest breadth scores (for stats)
+                    if len(cand_pool) - self.breadth <= c_i:
+                        latest_scores.append(score)
+
+                # Track "latest" stats
+                if self.track_stats and latest_scores:
+                    results_latest[id(p)]["depth"].append(d)
+                    results_latest[id(p)]["max"].append(max(latest_scores))
+                    results_latest[id(p)]["average"].append(sum(latest_scores) / len(latest_scores))
+                    results_latest[id(p)]["min"].append(min(latest_scores))
+                    results_latest[id(p)]["std"].append(np.std(latest_scores))
+
+                # Update greedy best config for this predictor
+                best_for_p = max(evaluated_candidates[id(p)].values(), key=lambda cc: cc["score"])
+                best_config[id(p)] = (best_for_p["instruction"], best_for_p["prefix"])
+
+                logger.debug(
+                    f"Updating Predictor {id(p)} to:\n"
+                    f"i: {best_for_p['instruction']}\n"
+                    f"p: {best_for_p['prefix']}"
+                )
+
+            # Stop before generating next wave
+            if d == self.depth - 1:
+                break
+
+            # === Generate next batch from attempts (top-K history) ===
+            new_candidates = {}
+            for p_base in module.predictors():
+                # Build attempts list from best-so-far evaluated candidates
+                best_list = sorted(
+                    evaluated_candidates[id(p_base)].values(),
+                    key=lambda x: x["score"],
+                    reverse=True,
+                )
+                k = min(len(best_list), self.breadth)
+                attempts = []
+                # Put k items, lower-scored to higher-scored (as your original did)
+                for i in range(k - 1, -1, -1):
+                    attempts.append(f'Instruction #{k-i}: {best_list[i]["instruction"]}')
+                    attempts.append(f'Prefix #{k-i}: {best_list[i]["prefix"]}')
+                    attempts.append(f'Resulting Score #{k-i}: {best_list[i]["score"]}')
+
+                if self.track_stats and best_list:
+                    top10 = [x["score"] for x in best_list[:10]]
+                    results_best[id(p_base)]["depth"].append(d)
+                    results_best[id(p_base)]["max"].append(max(top10))
+                    results_best[id(p_base)]["average"].append(sum(top10) / len(top10))
+                    results_best[id(p_base)]["min"].append(min(top10))
+                    results_best[id(p_base)]["std"].append(np.std(top10))
+
+                # Propose next prompts conditioned on attempts
+                if self.prompt_model:
+                    with dspy.settings.context(lm=self.prompt_model):
+                        instr = dspy.Predict(
+                            GenerateInstructionGivenAttempts,
+                            n=self.breadth,
+                            temperature=self.init_temperature,
+                        )(attempted_instructions=attempts)
+                else:
+                    instr = dspy.Predict(
+                        GenerateInstructionGivenAttempts,
+                        n=self.breadth,
+                        temperature=self.init_temperature,
+                    )(attempted_instructions=attempts)
+
+                # Save/accumulate
+                new_candidates[id(p_base)] = instr.completions
+                all_candidates[id(p_base)].proposed_instruction.extend(instr.completions.proposed_instruction)
+                all_candidates[id(p_base)].proposed_prefix_for_output_field.extend(
+                    instr.completions.proposed_prefix_for_output_field
+                )
+
+            latest_candidates = new_candidates
+
+    # ==== Final selection & return a fresh program ====
+    # Flatten all evaluated candidates just for reporting/debug
+        flat = []
+        for predictor in module.predictors():
+            flat.extend(list(evaluated_candidates[id(predictor)].values()))
+
+        # Deduplicate by (instruction, prefix) while keeping best score
+        seen = {}
+        for c in flat:
+            k = (c["instruction"], c["prefix"])
+            if k not in seen or seen[k]["score"] < c["score"]:
+                seen[k] = c
+        candidates_flat = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+
+        # Apply each predictor's own best config to the module and return it
+        for p in module.predictors():
+            instr, pref = best_config[id(p)]
+            _apply_sig(p, instr, pref)
+
+        # Attach diagnostics
+        module.candidate_programs = candidates_flat
+        module.total_calls = total_calls
+        if self.track_stats:
+            module.results_best = results_best
+            module.results_latest = results_latest
+
+        return module
